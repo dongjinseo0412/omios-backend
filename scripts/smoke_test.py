@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -23,20 +24,32 @@ class Check:
     min_items: int | None = None
 
 
+def parse_json(body: str) -> Any:
+    try:
+        return json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {"raw": body}
+
+
 def request_json(path: str) -> tuple[int, Any]:
     url = f"{BASE_URL}{path}"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             body = response.read().decode("utf-8")
-            return response.status, json.loads(body)
+            return response.status, parse_json(body)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8")
-        return exc.code, json.loads(body)
+        return exc.code, parse_json(body)
+    except urllib.error.URLError as exc:
+        return 0, {"error": "REQUEST_FAILED", "message": str(exc.reason)}
 
 
 def validate(check: Check) -> tuple[bool, str]:
     status, payload = request_json(check.path)
+    if status == 0:
+        return False, f"{check.name}: request failed ({payload.get('message', 'unknown error')})"
+
     if status != check.expected_status:
         return False, f"{check.name}: expected HTTP {check.expected_status}, got {status}"
 
@@ -44,6 +57,11 @@ def validate(check: Check) -> tuple[bool, str]:
         if payload.get("error") != check.expected_error:
             return False, f"{check.name}: expected error {check.expected_error}, got {payload.get('error')}"
         return True, f"{check.name}: HTTP {status} {check.expected_error}"
+
+    if check.name == "health":
+        expected = {"status": "OK", "message": "server is running"}
+        if payload != expected:
+            return False, f"{check.name}: expected {expected}, got {payload}"
 
     if check.expect_data and "data" not in payload:
         return False, f"{check.name}: missing data field"

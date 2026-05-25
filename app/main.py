@@ -402,8 +402,6 @@ def read_root() -> dict[str, str]:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
     return {"status": "OK", "message": "server is running"}
 
 
