@@ -27,6 +27,8 @@ OMIOS_DB_PORT
 OMIOS_DB_NAME
 ```
 
+Railway MySQL 환경에서는 `OMIOS_DB_*`가 없을 때 `MYSQLHOST`, `MYSQLPORT`, `MYSQLUSER`, `MYSQLPASSWORD`, `MYSQLDATABASE`를 fallback으로 사용합니다.
+
 선택 환경변수:
 
 ```txt

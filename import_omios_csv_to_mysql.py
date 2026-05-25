@@ -251,10 +251,10 @@ def sql_statements(sql: str) -> Iterable[str]:
 def connect(database: str | None = None):
     import pymysql
     return pymysql.connect(
-        host=os.getenv("OMIOS_DB_HOST", "localhost"),
-        port=int(os.getenv("OMIOS_DB_PORT", "3306")),
-        user=os.getenv("OMIOS_DB_USER", "root"),
-        password=os.getenv("OMIOS_DB_PASSWORD", ""),
+        host=os.getenv("OMIOS_DB_HOST") or os.getenv("MYSQLHOST", "localhost"),
+        port=int(os.getenv("OMIOS_DB_PORT") or os.getenv("MYSQLPORT", "3306")),
+        user=os.getenv("OMIOS_DB_USER") or os.getenv("MYSQLUSER", "root"),
+        password=os.getenv("OMIOS_DB_PASSWORD") or os.getenv("MYSQLPASSWORD", ""),
         database=database,
         charset="utf8mb4",
         autocommit=False,
@@ -298,7 +298,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=".", help="Directory containing OMIOS CSV files")
     parser.add_argument("--schema", default="omios_mysql_schema.sql", help="Path to schema SQL file")
-    parser.add_argument("--db-name", default=os.getenv("OMIOS_DB_NAME", "omios"), help="MySQL database name")
+    parser.add_argument("--db-name", default=os.getenv("OMIOS_DB_NAME") or os.getenv("MYSQLDATABASE", "omios"), help="MySQL database name")
     parser.add_argument("--reset", action="store_true", help="Drop/recreate OMIOS tables using the schema file before import")
     parser.add_argument("--validate-only", action="store_true", help="Only validate CSV structure and relationships, then exit")
     args = parser.parse_args()

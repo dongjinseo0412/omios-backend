@@ -83,7 +83,9 @@ MYSQLDATABASE
 MYSQL_URL
 ```
 
-현재 코드는 `OMIOS_DB_*`를 읽으므로 백엔드 서비스 Variables에 아래처럼 매핑합니다.
+현재 코드는 `OMIOS_DB_*`를 우선 사용하고, 값이 없으면 Railway MySQL의 `MYSQL*` 변수를 fallback으로 사용합니다. Railway가 백엔드 서비스에 `MYSQLHOST`, `MYSQLPORT`, `MYSQLUSER`, `MYSQLPASSWORD`, `MYSQLDATABASE`를 직접 주입하도록 연결되어 있다면 별도 매핑 없이도 동작할 수 있습니다.
+
+명시적으로 관리하려면 백엔드 서비스 Variables에 아래처럼 매핑합니다.
 
 ```txt
 OMIOS_DB_HOST=${{ MySQL.MYSQLHOST }}

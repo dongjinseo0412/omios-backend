@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -10,7 +11,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import certifi
+
 BASE_URL = os.getenv("OMIOS_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 @dataclass
@@ -35,7 +39,7 @@ def request_json(path: str) -> tuple[int, Any]:
     url = f"{BASE_URL}{path}"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=10, context=SSL_CONTEXT) as response:
             body = response.read().decode("utf-8")
             return response.status, parse_json(body)
     except urllib.error.HTTPError as exc:
