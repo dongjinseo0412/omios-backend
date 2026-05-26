@@ -262,12 +262,22 @@ def connect(database: str | None = None):
     )
 
 
-def apply_schema(schema_path: Path) -> None:
+def is_database_selection_statement(stmt: str) -> bool:
+    upper = stmt.lstrip().upper()
+    return upper.startswith("CREATE DATABASE") or upper.startswith("USE ")
+
+
+def apply_schema(schema_path: Path, database: str) -> None:
     sql = schema_path.read_text(encoding="utf-8")
-    conn = connect(database=None)
+    # Execute table DDL in the configured target database. The schema file keeps
+    # local `CREATE DATABASE omios` / `USE omios` statements for manual use, but
+    # managed hosts such as Railway often provide a fixed DB name like `railway`.
+    conn = connect(database=database)
     try:
         with conn.cursor() as cur:
             for stmt in sql_statements(sql):
+                if is_database_selection_statement(stmt):
+                    continue
                 cur.execute(stmt)
         conn.commit()
     finally:
@@ -316,7 +326,7 @@ def main() -> None:
     if args.reset:
         if not schema_path.exists():
             raise FileNotFoundError(f"Schema file not found: {schema_path}")
-        apply_schema(schema_path)
+        apply_schema(schema_path, args.db_name)
 
     conn = connect(database=args.db_name)
     try:
