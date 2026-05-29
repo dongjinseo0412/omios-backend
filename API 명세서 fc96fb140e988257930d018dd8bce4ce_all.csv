@@ -23,3 +23,9 @@ API 서버 상태 확인,/api/health,,,,,GET,,,X,"{ ""status"": ""OK"", ""messag
 상품 없음,/api/products/{productCode},,,,,GET,,,X,"{ ""statusCode"": 404, ""error"": ""PRODUCT_NOT_FOUND"", ""message"": ""상품을 찾을 수 없습니다."" }"
 지역 없음,/api/regions/{regionCode},,,,,GET,,,X,"{ ""statusCode"": 404, ""error"": ""REGION_NOT_FOUND"", ""message"": ""지역 정보를 찾을 수 없습니다."" }"
 잘못된 요청값,/api/products?priceRangeCode=INVALID,,,,,GET,,,X,"{ ""statusCode"": 400, ""error"": ""INVALID_PARAMETER"", ""message"": ""요청 파라미터가 올바르지 않습니다."" }"
+[찜/좋아요],,,,,,,,,,
+상품 찜 추가,/api/products/{productCode}/like?clientId=...,,,,,POST,,,X 또는 X-OMIOS-Client-Id header,"{ ""statusCode"": 200, ""data"": { ""productCode"": ""PRD_041"", ""liked"": true, ""likeCount"": 1 } }"
+상품 찜 취소,/api/products/{productCode}/like?clientId=...,,,,,DELETE,,,X 또는 X-OMIOS-Client-Id header,"{ ""statusCode"": 200, ""data"": { ""productCode"": ""PRD_041"", ""liked"": false, ""likeCount"": 0 } }"
+상품 찜 토글,/api/products/{productCode}/like/toggle?clientId=...,,,,,POST,,,X 또는 X-OMIOS-Client-Id header,"{ ""statusCode"": 200, ""data"": { ""productCode"": ""PRD_041"", ""liked"": true, ""likeCount"": 1 } }"
+상품 찜 상태/수 조회,/api/products/{productCode}/like?clientId=...,,,,,GET,,,X,"{ ""statusCode"": 200, ""data"": { ""productCode"": ""PRD_041"", ""liked"": true, ""likeCount"": 1 } }"
+사용자 찜 상품 목록 조회,/api/product-likes?clientId=...&sort=likes_desc,,,,,GET,,,X,"{ ""statusCode"": 200, ""data"": { ""items"": [], ""page"": 1, ""limit"": 20, ""totalCount"": 0, ""sort"": ""likes_desc"" } }"

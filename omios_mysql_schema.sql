@@ -10,6 +10,8 @@ USE omios;
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS product_purchase_locations;
 DROP TABLE IF EXISTS product_links;
+DROP TABLE IF EXISTS product_like_counts;
+DROP TABLE IF EXISTS product_likes;
 DROP TABLE IF EXISTS product_keywords;
 DROP TABLE IF EXISTS product_age_groups;
 DROP TABLE IF EXISTS product_targets;
@@ -119,6 +121,33 @@ CREATE TABLE products (
     INDEX idx_products_region (primary_region_code),
     INDEX idx_products_price (price),
     INDEX idx_products_price_range (price_range_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE product_likes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product_code VARCHAR(20) NOT NULL,
+    client_id VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_likes_product
+        FOREIGN KEY (product_code) REFERENCES products(product_code)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    UNIQUE KEY uq_product_likes_product_client (product_code, client_id),
+    INDEX idx_product_likes_product (product_code),
+    INDEX idx_product_likes_client (client_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE product_like_counts (
+    product_code VARCHAR(20) PRIMARY KEY,
+    like_count INT NOT NULL DEFAULT 0,
+    refreshed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_like_counts_product
+        FOREIGN KEY (product_code) REFERENCES products(product_code)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    INDEX idx_product_like_counts_count (like_count),
+    INDEX idx_product_like_counts_refreshed_at (refreshed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE product_targets (

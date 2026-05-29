@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -21,7 +21,41 @@ app.add_middleware(
 )
 
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
-VALID_SORTS = {"popular", "price_asc", "price_desc", "newest"}
+CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
+LIKE_COUNT_CACHE_TTL_SECONDS = 3600
+VALID_SORTS = {"popular", "price_asc", "price_desc", "newest", "likes_desc"}
+VALID_LIKED_PRODUCT_SORTS = {"liked_at_desc", "likes_desc"}
+
+PRODUCT_LIKES_DDL = """
+CREATE TABLE IF NOT EXISTS product_likes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product_code VARCHAR(20) NOT NULL,
+    client_id VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_likes_product
+        FOREIGN KEY (product_code) REFERENCES products(product_code)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    UNIQUE KEY uq_product_likes_product_client (product_code, client_id),
+    INDEX idx_product_likes_product (product_code),
+    INDEX idx_product_likes_client (client_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+PRODUCT_LIKE_COUNTS_DDL = """
+CREATE TABLE IF NOT EXISTS product_like_counts (
+    product_code VARCHAR(20) PRIMARY KEY,
+    like_count INT NOT NULL DEFAULT 0,
+    refreshed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_like_counts_product
+        FOREIGN KEY (product_code) REFERENCES products(product_code)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    INDEX idx_product_like_counts_count (like_count),
+    INDEX idx_product_like_counts_refreshed_at (refreshed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
 
 
 @app.exception_handler(HTTPException)
@@ -87,6 +121,22 @@ def fetch_all(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, 
     return [dict(row) for row in rows]
 
 
+def execute_write(sql: str, params: dict[str, Any] | None = None) -> None:
+    with engine.begin() as connection:
+        connection.execute(text(sql), params or {})
+
+
+def init_like_tables() -> None:
+    with engine.begin() as connection:
+        connection.execute(text(PRODUCT_LIKES_DDL))
+        connection.execute(text(PRODUCT_LIKE_COUNTS_DDL))
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_like_tables()
+
+
 def code_exists(table: str, column: str, value: str | None) -> bool:
     if not value:
         return True
@@ -99,8 +149,27 @@ def validate_positive_pagination(page: int, limit: int) -> None:
         invalid_parameter()
 
 
+def normalize_client_id(client_id: str | None) -> str | None:
+    if client_id is None:
+        return None
+    client_id = client_id.strip()
+    if not client_id:
+        return None
+    if not CLIENT_ID_PATTERN.fullmatch(client_id):
+        invalid_parameter()
+    return client_id
+
+
+def resolve_client_id(client_id: str | None, header_client_id: str | None = None, required: bool = False) -> str | None:
+    resolved = normalize_client_id(client_id) or normalize_client_id(header_client_id)
+    if required and not resolved:
+        invalid_parameter()
+    return resolved
+
+
 def validate_product_filters(
     regionCode: str | None,
+    locationCode: str | None,
     priceRangeCode: str | None,
     keywordCode: str | None,
     targetCode: str | None,
@@ -111,6 +180,7 @@ def validate_product_filters(
         invalid_parameter()
     checks = [
         ("regions", "region_code", regionCode),
+        ("purchase_locations", "location_code", locationCode),
         ("price_ranges", "price_range_code", priceRangeCode),
         ("keywords", "keyword_code", keywordCode),
         ("gift_targets", "target_code", targetCode),
@@ -157,6 +227,8 @@ def product_list_item(row: dict[str, Any], keywords: list[str] | None = None) ->
         "imageUrl": row.get("image_url"),
         "region": region_summary(row),
         "keywords": keywords or [],
+        "likeCount": int(row.get("like_count") or 0),
+        "likedByCurrentUser": bool(row.get("liked_by_current_user")),
     }
 
 
@@ -180,7 +252,23 @@ def get_keywords_by_products(product_codes: list[str]) -> dict[str, list[str]]:
     return grouped
 
 
-def product_base_select() -> str:
+def product_base_select(include_liked_status: bool = False) -> str:
+    liked_status_sql = (
+        """
+            CASE
+                WHEN :clientId IS NULL THEN 0
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM product_likes upl
+                    WHERE upl.product_code = p.product_code
+                      AND upl.client_id = :clientId
+                ) THEN 1
+                ELSE 0
+            END AS liked_by_current_user
+        """
+        if include_liked_status
+        else "0 AS liked_by_current_user"
+    )
     return """
         SELECT
             p.product_code,
@@ -200,15 +288,19 @@ def product_base_select() -> str:
             p.price_range_code,
             pr.label AS price_range_label,
             pr.min_price,
-            pr.max_price
+            pr.max_price,
+            COALESCE(plc.like_count, 0) AS like_count,
+            {liked_status_sql}
         FROM products p
         LEFT JOIN regions r ON p.primary_region_code = r.region_code
         LEFT JOIN price_ranges pr ON p.price_range_code = pr.price_range_code
-    """
+        LEFT JOIN product_like_counts plc ON p.product_code = plc.product_code
+    """.format(liked_status_sql=liked_status_sql)
 
 
 def build_product_filter_sql(
     regionCode: str | None,
+    locationCode: str | None,
     priceRangeCode: str | None,
     keywordCode: str | None,
     targetCode: str | None,
@@ -220,6 +312,11 @@ def build_product_filter_sql(
     if regionCode:
         where.append("p.primary_region_code = :regionCode")
         params["regionCode"] = regionCode
+    if locationCode:
+        where.append(
+            "EXISTS (SELECT 1 FROM product_purchase_locations fppl WHERE fppl.product_code = p.product_code AND fppl.location_code = :locationCode)"
+        )
+        params["locationCode"] = locationCode
     if priceRangeCode:
         where.append("p.price_range_code = :priceRangeCode")
         params["priceRangeCode"] = priceRangeCode
@@ -261,6 +358,8 @@ def build_product_filter_sql(
 
 
 def product_order_by(sort: str | None) -> str:
+    if sort == "likes_desc":
+        return "COALESCE(plc.like_count, 0) DESC, p.product_code ASC"
     if sort == "price_asc":
         return "p.price IS NULL ASC, p.price ASC, p.product_code ASC"
     if sort == "price_desc":
@@ -271,28 +370,115 @@ def product_order_by(sort: str | None) -> str:
     return "p.product_code ASC"
 
 
+def refresh_all_like_counts() -> None:
+    # Lightweight backend-side 1-hour refresh strategy:
+    # keep an aggregate table refreshed by API requests instead of adding a scheduler/worker.
+    execute_write(
+        """
+        INSERT INTO product_like_counts (product_code, like_count, refreshed_at)
+        SELECT p.product_code, COUNT(pl.id) AS like_count, CURRENT_TIMESTAMP AS refreshed_at
+        FROM products p
+        LEFT JOIN product_likes pl ON p.product_code = pl.product_code
+        GROUP BY p.product_code
+        ON DUPLICATE KEY UPDATE
+            like_count = VALUES(like_count),
+            refreshed_at = VALUES(refreshed_at)
+        """
+    )
+
+
+def refresh_product_like_count(productCode: str) -> None:
+    execute_write(
+        """
+        INSERT INTO product_like_counts (product_code, like_count, refreshed_at)
+        SELECT p.product_code, COUNT(pl.id) AS like_count, CURRENT_TIMESTAMP AS refreshed_at
+        FROM products p
+        LEFT JOIN product_likes pl ON p.product_code = pl.product_code
+        WHERE p.product_code = :productCode
+        GROUP BY p.product_code
+        ON DUPLICATE KEY UPDATE
+            like_count = VALUES(like_count),
+            refreshed_at = VALUES(refreshed_at)
+        """,
+        {"productCode": productCode},
+    )
+
+
+def ensure_like_counts_fresh() -> None:
+    summary = fetch_one(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM products) AS product_count,
+            COUNT(*) AS cached_count,
+            COALESCE(TIMESTAMPDIFF(SECOND, MIN(refreshed_at), CURRENT_TIMESTAMP), :ttlSeconds + 1) AS oldest_age_seconds
+        FROM product_like_counts
+        """,
+        {"ttlSeconds": LIKE_COUNT_CACHE_TTL_SECONDS},
+    )
+    if not summary:
+        refresh_all_like_counts()
+        return
+    if summary["cached_count"] < summary["product_count"] or summary["oldest_age_seconds"] >= LIKE_COUNT_CACHE_TTL_SECONDS:
+        refresh_all_like_counts()
+
+
+def product_like_state(productCode: str, clientId: str | None = None) -> dict[str, Any]:
+    refresh_product_like_count(productCode)
+    row = fetch_one(
+        """
+        SELECT
+            p.product_code,
+            COALESCE(plc.like_count, 0) AS like_count,
+            CASE
+                WHEN :clientId IS NULL THEN 0
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM product_likes upl
+                    WHERE upl.product_code = p.product_code
+                      AND upl.client_id = :clientId
+                ) THEN 1
+                ELSE 0
+            END AS liked
+        FROM products p
+        LEFT JOIN product_like_counts plc ON p.product_code = plc.product_code
+        WHERE p.product_code = :productCode
+        """,
+        {"productCode": productCode, "clientId": clientId},
+    )
+    if not row:
+        product_not_found()
+    return {
+        "productCode": row["product_code"],
+        "liked": bool(row.get("liked")),
+        "likeCount": int(row.get("like_count") or 0),
+    }
+
+
 def query_products(
     *,
     page: int,
     limit: int,
     sort: str | None = None,
     regionCode: str | None = None,
+    locationCode: str | None = None,
     priceRangeCode: str | None = None,
     keywordCode: str | None = None,
     targetCode: str | None = None,
     ageGroupCode: str | None = None,
     keyword: str | None = None,
+    clientId: str | None = None,
 ) -> dict[str, Any]:
     validate_positive_pagination(page, limit)
-    validate_product_filters(regionCode, priceRangeCode, keywordCode, targetCode, ageGroupCode, sort)
+    validate_product_filters(regionCode, locationCode, priceRangeCode, keywordCode, targetCode, ageGroupCode, sort)
+    ensure_like_counts_fresh()
     where_sql, params = build_product_filter_sql(
-        regionCode, priceRangeCode, keywordCode, targetCode, ageGroupCode, keyword
+        regionCode, locationCode, priceRangeCode, keywordCode, targetCode, ageGroupCode, keyword
     )
     total = fetch_one(f"SELECT COUNT(*) AS total_count FROM products p WHERE {where_sql}", params)["total_count"]
-    params = {**params, "limit": limit, "offset": (page - 1) * limit}
+    params = {**params, "clientId": clientId, "limit": limit, "offset": (page - 1) * limit}
     rows = fetch_all(
         f"""
-        {product_base_select()}
+        {product_base_select(include_liked_status=True)}
         WHERE {where_sql}
         ORDER BY {product_order_by(sort)}
         LIMIT :limit OFFSET :offset
@@ -469,16 +655,55 @@ def get_region_products(
     page: int = Query(default=1),
     limit: int = Query(default=20),
     sort: str | None = Query(default=None),
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     validate_positive_pagination(page, limit)
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
     region = fetch_one(
         "SELECT region_code, name_ko FROM regions WHERE region_code = :regionCode",
         {"regionCode": regionCode},
     )
     if not region:
         region_not_found()
-    data = query_products(page=page, limit=limit, sort=sort, regionCode=regionCode)
+    data = query_products(page=page, limit=limit, sort=sort, regionCode=regionCode, clientId=resolved_client_id)
     data["region"] = {"regionCode": region["region_code"], "nameKo": region["name_ko"]}
+    return success(data)
+
+
+@app.get("/api/purchase-locations/{locationCode}/products")
+def get_purchase_location_products(
+    locationCode: str,
+    page: int = Query(default=1),
+    limit: int = Query(default=20),
+    sort: str | None = Query(default=None),
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    validate_positive_pagination(page, limit)
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
+    location = fetch_one(
+        """
+        SELECT pl.location_code, pl.name, pl.region_code, r.name_ko AS region_name_ko
+        FROM purchase_locations pl
+        LEFT JOIN regions r ON pl.region_code = r.region_code
+        WHERE pl.location_code = :locationCode
+        """,
+        {"locationCode": locationCode},
+    )
+    if not location:
+        invalid_parameter()
+    data = query_products(page=page, limit=limit, sort=sort, locationCode=locationCode, clientId=resolved_client_id)
+    data["location"] = {
+        "locationCode": location["location_code"],
+        "name": location["name"],
+        "region": {
+            "regionCode": location.get("region_code"),
+            "nameKo": location.get("region_name_ko"),
+        }
+        if location.get("region_code")
+        else None,
+    }
     return success(data)
 
 
@@ -518,15 +743,19 @@ def search_products(
     keyword: str = Query(..., min_length=1),
     page: int = Query(default=1),
     limit: int = Query(default=20),
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     validate_positive_pagination(page, limit)
-    data = query_products(page=page, limit=limit, keyword=keyword)
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
+    data = query_products(page=page, limit=limit, keyword=keyword, clientId=resolved_client_id)
     return success({"keyword": keyword, **data})
 
 
 @app.get("/api/products")
 def get_products(
     regionCode: str | None = Query(default=None),
+    locationCode: str | None = Query(default=None),
     priceRangeCode: str | None = Query(default=None),
     keywordCode: str | None = Query(default=None),
     targetCode: str | None = Query(default=None),
@@ -534,19 +763,25 @@ def get_products(
     sort: str | None = Query(default=None),
     page: int = Query(default=1),
     limit: int = Query(default=20),
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
     data = query_products(
         page=page,
         limit=limit,
         sort=sort,
         regionCode=regionCode,
+        locationCode=locationCode,
         priceRangeCode=priceRangeCode,
         keywordCode=keywordCode,
         targetCode=targetCode,
         ageGroupCode=ageGroupCode,
+        clientId=resolved_client_id,
     )
     filters = {
         "regionCode": regionCode,
+        "locationCode": locationCode,
         "priceRangeCode": priceRangeCode,
         "keywordCode": keywordCode,
         "targetCode": targetCode,
@@ -558,9 +793,156 @@ def get_products(
     return success(data)
 
 
+@app.post("/api/products/{productCode}/like")
+def like_product(
+    productCode: str,
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
+    if not code_exists("products", "product_code", productCode):
+        product_not_found()
+    execute_write(
+        """
+        INSERT IGNORE INTO product_likes (product_code, client_id)
+        VALUES (:productCode, :clientId)
+        """,
+        {"productCode": productCode, "clientId": resolved_client_id},
+    )
+    return success(product_like_state(productCode, resolved_client_id))
+
+
+@app.delete("/api/products/{productCode}/like")
+def unlike_product(
+    productCode: str,
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
+    if not code_exists("products", "product_code", productCode):
+        product_not_found()
+    execute_write(
+        """
+        DELETE FROM product_likes
+        WHERE product_code = :productCode
+          AND client_id = :clientId
+        """,
+        {"productCode": productCode, "clientId": resolved_client_id},
+    )
+    return success(product_like_state(productCode, resolved_client_id))
+
+
+@app.post("/api/products/{productCode}/like/toggle")
+def toggle_product_like(
+    productCode: str,
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
+    if not code_exists("products", "product_code", productCode):
+        product_not_found()
+    existing = fetch_one(
+        """
+        SELECT 1 AS liked
+        FROM product_likes
+        WHERE product_code = :productCode
+          AND client_id = :clientId
+        LIMIT 1
+        """,
+        {"productCode": productCode, "clientId": resolved_client_id},
+    )
+    if existing:
+        execute_write(
+            """
+            DELETE FROM product_likes
+            WHERE product_code = :productCode
+              AND client_id = :clientId
+            """,
+            {"productCode": productCode, "clientId": resolved_client_id},
+        )
+    else:
+        execute_write(
+            """
+            INSERT IGNORE INTO product_likes (product_code, client_id)
+            VALUES (:productCode, :clientId)
+            """,
+            {"productCode": productCode, "clientId": resolved_client_id},
+        )
+    return success(product_like_state(productCode, resolved_client_id))
+
+
+@app.get("/api/products/{productCode}/like")
+def get_product_like(
+    productCode: str,
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
+    if not code_exists("products", "product_code", productCode):
+        product_not_found()
+    return success(product_like_state(productCode, resolved_client_id))
+
+
+@app.get("/api/product-likes")
+def get_liked_products(
+    clientId: str | None = Query(default=None),
+    page: int = Query(default=1),
+    limit: int = Query(default=20),
+    sort: str | None = Query(default="liked_at_desc"),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    validate_positive_pagination(page, limit)
+    if sort not in VALID_LIKED_PRODUCT_SORTS:
+        invalid_parameter()
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
+    ensure_like_counts_fresh()
+    params = {"clientId": resolved_client_id, "limit": limit, "offset": (page - 1) * limit}
+    total = fetch_one(
+        """
+        SELECT COUNT(*) AS total_count
+        FROM product_likes user_likes
+        JOIN products p ON user_likes.product_code = p.product_code
+        WHERE user_likes.client_id = :clientId
+        """,
+        {"clientId": resolved_client_id},
+    )["total_count"]
+    order_by = "user_likes.created_at DESC, p.product_code ASC" if sort == "liked_at_desc" else product_order_by(sort)
+    rows = fetch_all(
+        f"""
+        {product_base_select(include_liked_status=True)}
+        JOIN product_likes user_likes
+          ON user_likes.product_code = p.product_code
+         AND user_likes.client_id = :clientId
+        ORDER BY {order_by}
+        LIMIT :limit OFFSET :offset
+        """,
+        params,
+    )
+    product_codes = [row["product_code"] for row in rows]
+    keywords_map = get_keywords_by_products(product_codes)
+    return success(
+        {
+            "items": [product_list_item(row, keywords_map.get(row["product_code"], [])) for row in rows],
+            "page": page,
+            "limit": limit,
+            "totalCount": total,
+            "sort": sort,
+        }
+    )
+
+
 @app.get("/api/products/{productCode}")
-def get_product(productCode: str) -> dict[str, Any]:
-    row = fetch_one(f"{product_base_select()} WHERE p.product_code = :productCode", {"productCode": productCode})
+def get_product(
+    productCode: str,
+    clientId: str | None = Query(default=None),
+    x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
+) -> dict[str, Any]:
+    resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
+    ensure_like_counts_fresh()
+    row = fetch_one(
+        f"{product_base_select(include_liked_status=True)} WHERE p.product_code = :productCode",
+        {"productCode": productCode, "clientId": resolved_client_id},
+    )
     if not row:
         product_not_found()
 
@@ -608,6 +990,8 @@ def get_product(productCode: str) -> dict[str, Any]:
             "isRegionLimited": bool(row.get("is_region_limited")),
             "region": region_summary(row),
             "priceRange": price_range_summary(row),
+            "likeCount": int(row.get("like_count") or 0),
+            "likedByCurrentUser": bool(row.get("liked_by_current_user")),
             "keywords": [
                 {"keywordCode": item["keyword_code"], "name": item["name"], "category": item.get("category")}
                 for item in keywords
