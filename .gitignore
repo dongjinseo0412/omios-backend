@@ -14,3 +14,7 @@ __pycache__/
 
 app/data_backup/
 .omx/
+
+*.bak
+*.bak*
+OMIOS_BACKEND_NOTION_SUMMARY.md
