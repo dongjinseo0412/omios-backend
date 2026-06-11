@@ -57,6 +57,50 @@ CREATE TABLE IF NOT EXISTS product_like_counts (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+PRODUCT_IS_ACTIVE_COLUMN = "is_active"
+
+
+def ensure_products_is_active_column() -> None:
+    """Ensure product soft-hide flag exists without touching product/like rows."""
+    with engine.begin() as connection:
+        column_exists = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'products'
+                  AND COLUMN_NAME = :columnName
+                LIMIT 1
+                """
+            ),
+            {"columnName": PRODUCT_IS_ACTIVE_COLUMN},
+        ).scalar()
+        if not column_exists:
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE products
+                    ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1
+                    AFTER is_region_limited
+                    """
+                )
+            )
+        index_exists = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'products'
+                  AND INDEX_NAME = 'idx_products_is_active'
+                LIMIT 1
+                """
+            )
+        ).scalar()
+        if not index_exists:
+            connection.execute(text("CREATE INDEX idx_products_is_active ON products (is_active)"))
+
 
 @app.exception_handler(HTTPException)
 def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
@@ -134,6 +178,7 @@ def init_like_tables() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
+    ensure_products_is_active_column()
     init_like_tables()
 
 
@@ -141,6 +186,22 @@ def code_exists(table: str, column: str, value: str | None) -> bool:
     if not value:
         return True
     row = fetch_one(f"SELECT 1 AS ok FROM {table} WHERE {column} = :value LIMIT 1", {"value": value})
+    return row is not None
+
+
+def active_product_exists(productCode: str | None) -> bool:
+    if not productCode:
+        return False
+    row = fetch_one(
+        """
+        SELECT 1 AS ok
+        FROM products
+        WHERE product_code = :productCode
+          AND is_active = 1
+        LIMIT 1
+        """,
+        {"productCode": productCode},
+    )
     return row is not None
 
 
@@ -307,7 +368,7 @@ def build_product_filter_sql(
     ageGroupCode: str | None,
     keyword: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    where = ["1 = 1"]
+    where = ["p.is_active = 1"]
     params: dict[str, Any] = {}
     if regionCode:
         where.append("p.primary_region_code = :regionCode")
@@ -442,6 +503,7 @@ def product_like_state(productCode: str, clientId: str | None = None) -> dict[st
         FROM products p
         LEFT JOIN product_like_counts plc ON p.product_code = plc.product_code
         WHERE p.product_code = :productCode
+          AND p.is_active = 1
         """,
         {"productCode": productCode, "clientId": clientId},
     )
@@ -496,7 +558,7 @@ def query_products(
 
 
 def get_purchase_locations_data(productCode: str, require_product: bool = True) -> list[dict[str, Any]]:
-    if require_product and not code_exists("products", "product_code", productCode):
+    if require_product and not active_product_exists(productCode):
         product_not_found()
     rows = fetch_all(
         """
@@ -510,9 +572,11 @@ def get_purchase_locations_data(productCode: str, require_product: bool = True) 
             pl.region_code,
             r.name_ko AS region_name_ko
         FROM product_purchase_locations ppl
+        JOIN products p ON ppl.product_code = p.product_code
         JOIN purchase_locations pl ON ppl.location_code = pl.location_code
         LEFT JOIN regions r ON pl.region_code = r.region_code
         WHERE ppl.product_code = :productCode
+          AND p.is_active = 1
         ORDER BY pl.location_code
         """,
         {"productCode": productCode},
@@ -538,7 +602,7 @@ def get_purchase_locations_data(productCode: str, require_product: bool = True) 
 
 def get_links_data(productCode: str, require_product: bool = True) -> list[dict[str, Any]]:
     product = fetch_one(
-        "SELECT product_code, source_note FROM products WHERE product_code = :productCode",
+        "SELECT product_code, source_note FROM products WHERE product_code = :productCode AND is_active = 1",
         {"productCode": productCode},
     )
     if not product:
@@ -633,6 +697,7 @@ def get_region(regionCode: str) -> dict[str, Any]:
         JOIN product_keywords pk ON p.product_code = pk.product_code
         JOIN keywords k ON pk.keyword_code = k.keyword_code
         WHERE p.primary_region_code = :regionCode
+          AND p.is_active = 1
         ORDER BY k.keyword_code
         LIMIT 20
         """,
@@ -722,6 +787,7 @@ def get_region_keywords(regionCode: str) -> dict[str, Any]:
         JOIN product_keywords pk ON p.product_code = pk.product_code
         JOIN keywords k ON pk.keyword_code = k.keyword_code
         WHERE p.primary_region_code = :regionCode
+          AND p.is_active = 1
         ORDER BY k.keyword_code
         """,
         {"regionCode": regionCode},
@@ -800,7 +866,7 @@ def like_product(
     x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
-    if not code_exists("products", "product_code", productCode):
+    if not active_product_exists(productCode):
         product_not_found()
     execute_write(
         """
@@ -819,7 +885,7 @@ def unlike_product(
     x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
-    if not code_exists("products", "product_code", productCode):
+    if not active_product_exists(productCode):
         product_not_found()
     execute_write(
         """
@@ -839,7 +905,7 @@ def toggle_product_like(
     x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     resolved_client_id = resolve_client_id(clientId, x_omios_client_id, required=True)
-    if not code_exists("products", "product_code", productCode):
+    if not active_product_exists(productCode):
         product_not_found()
     existing = fetch_one(
         """
@@ -878,7 +944,7 @@ def get_product_like(
     x_omios_client_id: str | None = Header(default=None, alias="X-OMIOS-Client-Id"),
 ) -> dict[str, Any]:
     resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
-    if not code_exists("products", "product_code", productCode):
+    if not active_product_exists(productCode):
         product_not_found()
     return success(product_like_state(productCode, resolved_client_id))
 
@@ -903,6 +969,7 @@ def get_liked_products(
         FROM product_likes user_likes
         JOIN products p ON user_likes.product_code = p.product_code
         WHERE user_likes.client_id = :clientId
+          AND p.is_active = 1
         """,
         {"clientId": resolved_client_id},
     )["total_count"]
@@ -913,6 +980,7 @@ def get_liked_products(
         JOIN product_likes user_likes
           ON user_likes.product_code = p.product_code
          AND user_likes.client_id = :clientId
+        WHERE p.is_active = 1
         ORDER BY {order_by}
         LIMIT :limit OFFSET :offset
         """,
@@ -940,7 +1008,7 @@ def get_product(
     resolved_client_id = resolve_client_id(clientId, x_omios_client_id)
     ensure_like_counts_fresh()
     row = fetch_one(
-        f"{product_base_select(include_liked_status=True)} WHERE p.product_code = :productCode",
+        f"{product_base_select(include_liked_status=True)} WHERE p.product_code = :productCode AND p.is_active = 1",
         {"productCode": productCode, "clientId": resolved_client_id},
     )
     if not row:

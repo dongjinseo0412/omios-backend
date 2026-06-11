@@ -97,7 +97,7 @@ TABLE_COLUMNS = {
     "age_groups": ["age_group_code", "name", "min_age", "max_age", "is_active", "note"],
     "keywords": ["keyword_code", "name", "category", "description", "is_active", "note"],
     "purchase_locations": ["location_code", "region_code", "name", "location_type", "description", "address", "website_url", "is_active", "note"],
-    "products": ["product_code", "name_ko", "name_jp", "brand_name", "primary_region_code", "price_range_code", "price", "description", "purchase_tip", "is_region_limited", "image_url", "source_note", "collector", "collected_date", "note"],
+    "products": ["product_code", "name_ko", "name_jp", "brand_name", "primary_region_code", "price_range_code", "price", "description", "purchase_tip", "is_region_limited", "is_active", "image_url", "source_note", "collector", "collected_date", "note"],
     "product_targets": ["product_code", "target_code", "note"],
     "product_age_groups": ["product_code", "age_group_code", "note"],
     "product_keywords": ["product_code", "keyword_code", "note"],

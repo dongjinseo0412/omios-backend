@@ -103,6 +103,7 @@ CREATE TABLE products (
     description TEXT,
     purchase_tip TEXT,
     is_region_limited TINYINT(1) NOT NULL DEFAULT 0,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
     image_url TEXT,
     source_note TEXT,
     collector VARCHAR(100),
@@ -120,7 +121,8 @@ CREATE TABLE products (
         ON DELETE RESTRICT,
     INDEX idx_products_region (primary_region_code),
     INDEX idx_products_price (price),
-    INDEX idx_products_price_range (price_range_code)
+    INDEX idx_products_price_range (price_range_code),
+    INDEX idx_products_is_active (is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE product_likes (
